@@ -5,7 +5,7 @@ from bs4 import BeautifulSoup
 import os
 
 app = Flask(__name__)
-CORS(app)  # Разрешить кросс-доменные запросы
+CORS(app)  # Разрешить запросы с HTML-страниц
 
 @app.route('/')
 def index():
@@ -23,18 +23,22 @@ def parse():
         r = requests.get(url, headers=headers)
         soup = BeautifulSoup(r.text, 'html.parser')
 
-        title_tag = soup.find('h1', class_='item__title')
-        price_tag = soup.find('div', class_='item__price-once')
-        img_tag = soup.find('img', class_='item__gallery-img')
+        # Название товара
+        title_tag = soup.find('h1')
+        title = title_tag.get_text(strip=True) if title_tag else None
 
-        if not title_tag or not price_tag or not img_tag:
+        # Цена товара
+        price_tag = soup.select_one('[data-test-id="product-price"]')
+        price = price_tag.get_text(strip=True) if price_tag else None
+
+        # Картинка товара
+        img_tag = soup.select_one('picture img')
+        img = img_tag['src'] if img_tag else None
+
+        if not title or not price or not img:
             return jsonify({
-                'error': 'Не удалось получить данные. Проверьте ссылку или структуру страницы Kaspi.'
+                'error': 'Не удалось получить данные. Kaspi мог изменить структуру страницы.'
             }), 500
-
-        title = title_tag.get_text(strip=True)
-        price = price_tag.get_text(strip=True)
-        img = img_tag['src']
 
         return jsonify({
             'title': title,
