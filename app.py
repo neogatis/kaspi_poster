@@ -14,7 +14,7 @@ def index():
 @app.route('/parse', methods=['POST'])
 def parse():
     url = request.json['url']
-
+    
     headers = {
         "User-Agent": "Mozilla/5.0"
     }
@@ -23,22 +23,25 @@ def parse():
         r = requests.get(url, headers=headers)
         soup = BeautifulSoup(r.text, 'html.parser')
 
-     title_tag = soup.find('h1', class_='item__title')
-price_tag = soup.find('div', class_='item__price-once')
-img_tag = soup.find('img', class_='item__gallery-img')
+        title_tag = soup.find('h1', class_='item__title')
+        price_tag = soup.find('div', class_='item__price-once')
+        img_tag = soup.find('img', class_='item__gallery-img')
 
-if not title_tag or not price_tag or not img_tag:
-    return jsonify({'error': 'Не удалось получить данные с Kaspi. Возможно, структура страницы изменилась.'}), 500
+        if not title_tag or not price_tag or not img_tag:
+            return jsonify({
+                'error': 'Не удалось получить данные. Проверьте ссылку или структуру страницы Kaspi.'
+            }), 500
 
-title = title_tag.get_text(strip=True)
-price = price_tag.get_text(strip=True)
-img = img_tag['src']
+        title = title_tag.get_text(strip=True)
+        price = price_tag.get_text(strip=True)
+        img = img_tag['src']
 
         return jsonify({
             'title': title,
             'price': price,
             'img': img
         })
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
