@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Kaspi → Instagram</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px; }
+    input, button, textarea { width: 100%; padding: 10px; margin: 10px 0; }
+    img { max-width: 100%; margin-top: 10px; display: none; }
+  </style>
+</head>
+<body>
+  <h2>Kaspi → Instagram пост</h2>
+
+  <input type="text" id="kaspiUrl" placeholder="Вставьте ссылку на товар Kaspi">
+  <button onclick="fetchData()">Получить данные</button>
+
+  <img id="productImg" src="" />
+  <textarea id="postText" readonly></textarea>
+
+  <script>
+    async function fetchData() {
+      const url = document.getElementById('kaspiUrl').value;
+      const res = await fetch('https://kaspi-poster.onrender.com/parse', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ url })
+      });
+
+      const data = await res.json();
+
+      if (data.error) {
+        alert('Ошибка: ' + data.error);
+        return;
+      }
+
+      document.getElementById('productImg').src = data.img;
+      document.getElementById('productImg').style.display = 'block';
+
+      const post = `🔥 ${data.title}
+💰 Цена: ${data.price}
+
+📦 В наличии на Kaspi
+🛍️ Быстрая доставка
+
+#kaspi #казахстан #instashop`;
+
+      document.getElementById('postText').value = post;
+    }
+  </script>
+</body>
+</html>
