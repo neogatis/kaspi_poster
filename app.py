@@ -23,9 +23,16 @@ def parse():
         r = requests.get(url, headers=headers)
         soup = BeautifulSoup(r.text, 'html.parser')
 
-        title = soup.find('h1', class_='item__title').get_text(strip=True)
-        price = soup.find('div', class_='item__price-once').get_text(strip=True)
-        img = soup.find('img', class_='item__gallery-img')['src']
+     title_tag = soup.find('h1', class_='item__title')
+price_tag = soup.find('div', class_='item__price-once')
+img_tag = soup.find('img', class_='item__gallery-img')
+
+if not title_tag or not price_tag or not img_tag:
+    return jsonify({'error': 'Не удалось получить данные с Kaspi. Возможно, структура страницы изменилась.'}), 500
+
+title = title_tag.get_text(strip=True)
+price = price_tag.get_text(strip=True)
+img = img_tag['src']
 
         return jsonify({
             'title': title,
