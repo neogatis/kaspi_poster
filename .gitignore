@@ -1,0 +1,12 @@
+.env
+.env.*
+*.db
+*.db-wal
+*.db-shm
+secret.key
+data/
+backups/
+.railway/
+__pycache__/
+*.pyc
+*.log

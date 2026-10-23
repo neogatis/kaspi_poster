@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+!.env.server.example
+data/
+*.db
+*.zip
+.git/
+__pycache__/
+.venv/
