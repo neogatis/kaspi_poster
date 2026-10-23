@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light" />
+<title>Ambrello · Себестоимость и остатки</title>
+<link rel="stylesheet" href="/panel.css" />
+<script src="/panel.js" defer></script>
+</head>
+<body>
+<div class="app">
+<aside class="sidebar">
+  <div class="brand"><span class="brand-icon">A<span>.</span></span><span><strong>ambrello</strong><small>Kaspi Inventory</small></span></div>
+  <p class="side-title">РАБОЧЕЕ ПРОСТРАНСТВО</p>
+  <nav aria-label="Разделы">
+    <button class="side-link selected" data-section="all"><span>▦</span> Все товары</button>
+    <button class="side-link" data-section="missing"><span>◉</span> Нет себестоимости</button>
+    <button class="side-link" data-section="stock"><span>◫</span> Остатки на складе</button>
+  </nav>
+  <div class="side-bottom">
+    <div class="integration"><div class="integration-dot"></div><span>Синхронизация с Telegram<br><small>Общая база данных бота</small></span></div>
+    <button class="logout" id="logoutBtn">↪ Выйти</button>
+  </div>
+</aside>
+<main class="main">
+  <header class="topbar">
+    <div><div class="eyebrow">AMB RELLO / УПРАВЛЕНИЕ</div><h1>Товары и себестоимость <span class="beta">BETA</span></h1></div>
+    <div class="top-actions"><label class="shop-field"><span>Магазин</span><select id="shopSelect" aria-label="Выбрать магазин"></select></label><button id="refreshBtn" class="icon-button" title="Обновить данные">↻</button></div>
+  </header>
+  <div class="content">
+    <div class="intro"><div><h2>Всё под контролем.</h2><p>Укажите стоимость за штуку и фактические остатки. Цены сразу попадут в расчёт прибыли Telegram-бота.</p></div><div class="intro-badge">● Данные в реальном времени</div></div>
+    <div class="stats">
+      <div class="stat"><span>ТОВАРОВ В БАЗЕ</span><strong id="statAll">—</strong><small>Из истории заказов</small></div>
+      <div class="stat"><span>СЕБЕСТОИМОСТЬ ЗАДАНА</span><strong id="statCost">—</strong><small>Рассчитывается автоматически</small></div>
+      <div class="stat highlight"><span>ЖДУТ ЗАПОЛНЕНИЯ</span><strong id="statMissing">—</strong><small>Без закупочной цены</small></div>
+      <div class="stat"><span>ОСТАТКИ УКАЗАНЫ</span><strong id="statStocks">—</strong><small>Товарных позиций</small></div>
+    </div>
+    <section class="workspace">
+      <div class="work-head"><div><h2 id="sectionTitle">Каталог товаров</h2><p id="sectionDesc">Заполняйте себестоимость и остатки в удобной таблице.</p></div>
+        <div class="work-actions"><button id="exportBtn" class="ghost-btn">↓ Excel / CSV</button><button id="importBtn" class="ghost-btn">↑ Импорт CSV</button><input type="file" accept=".csv,text/csv" id="csvFile" hidden /></div>
+      </div>
+      <div class="filters"><label class="search"><span>⌕</span><input id="query" type="search" placeholder="Поиск: шапка, палантин, артикул, название…" autocomplete="off" /></label><select id="category" aria-label="Категория"><option value="">Все категории</option></select></div>
+      <div class="table-scroller"><table><thead><tr><th>ТОВАР</th><th>АРТИКУЛ</th><th>ПРОДАЖИ</th><th>СЕБЕСТОИМОСТЬ, ₸</th><th>ОСТАТОК, ШТ.</th><th>ПРИМЕНИТЬ ЦЕНУ</th></tr></thead><tbody id="productRows"></tbody></table><div id="empty" class="empty" hidden><span>◌</span><h3>Товары не найдены</h3><p>Измените запрос или фильтры.</p></div></div>
+      <div class="table-bottom"><div id="pagerInfo">—</div><div class="pager"><button class="icon-button" id="prevBtn">←</button><span id="pageInfo">1 / 1</span><button class="icon-button" id="nextBtn">→</button></div></div>
+    </section>
+    <p class="footnote">Важно: здесь показаны товары, встречавшиеся в заказах Kaspi. Остатки — ручной учёт, они пока не списываются автоматически после продажи. При одинаковом артикуле шапка и палантин остаются разными товарами.</p>
+  </div>
+</main>
+</div>
+<div class="save-bar" id="saveBar" hidden><span id="dirtyInfo">Есть несохранённые изменения</span><div><button class="cancel-btn" id="discardBtn">Отменить</button><button class="save-btn" id="saveBtn">Сохранить изменения →</button></div></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
