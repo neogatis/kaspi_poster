@@ -40,7 +40,8 @@
       <div class="work-head"><div><h2 id="sectionTitle">Каталог товаров</h2><p id="sectionDesc">Заполняйте себестоимость и остатки в удобной таблице.</p></div>
         <div class="work-actions"><button id="exportBtn" class="ghost-btn">↓ Excel / CSV</button><button id="importBtn" class="ghost-btn">↑ Импорт CSV</button><input type="file" accept=".csv,text/csv" id="csvFile" hidden /></div>
       </div>
-      <div class="filters"><label class="search"><span>⌕</span><input id="query" type="search" placeholder="Поиск: шапка, палантин, артикул, название…" autocomplete="off" /></label><select id="category" aria-label="Категория"><option value="">Все категории</option></select></div>
+      <div class="filters"><label class="search"><span>⌕</span><input id="query" type="search" placeholder="Поиск: шапка, палантин, артикул, название…" autocomplete="off" /></label><select id="category" aria-label="Категория"><option value="">Все категории</option></select><button class="ghost-btn" id="loadPhotosBtn" type="button" title="Найти фото через Kaspi по точному коду товара">🖼 Подгрузить фото</button></div>
+      <p id="photoProgress" class="photo-progress" role="status" aria-live="polite">Фотографии доступны для товаров, у которых Kaspi передал изображение. Остальные можно подгрузить.</p>
       <div class="table-scroller"><table><thead><tr><th>ТОВАР</th><th>АРТИКУЛ</th><th>ПРОДАЖИ</th><th>СЕБЕСТОИМОСТЬ, ₸</th><th>ОСТАТОК, ШТ.</th><th>ПРИМЕНИТЬ ЦЕНУ</th></tr></thead><tbody id="productRows"></tbody></table><div id="empty" class="empty" hidden><span>◌</span><h3>Товары не найдены</h3><p>Измените запрос или фильтры.</p></div></div>
       <div class="table-bottom"><div id="pagerInfo">—</div><div class="pager"><button class="icon-button" id="prevBtn">←</button><span id="pageInfo">1 / 1</span><button class="icon-button" id="nextBtn">→</button></div></div>
     </section>

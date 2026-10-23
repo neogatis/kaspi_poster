@@ -5,7 +5,9 @@ No credentials, Telegram tokens or merchant API secrets are exposed to the brows
 """
 from __future__ import annotations
 
+import asyncio
 import csv
+import queue
 import hashlib
 import hmac
 import io
@@ -32,6 +34,13 @@ PORT = int(os.getenv("PORT", "8080"))
 LINK_TTL = 10 * 60
 SESSION_TTL = 7 * 24 * 60 * 60
 MAX_BODY = 1024 * 1024
+# Single worker. Kaspi is rate-limited; never fan out image requests.
+PHOTO_QUEUE = queue.Queue(maxsize=200)
+PHOTO_PENDING = set()
+PHOTO_LOCK = threading.Lock()
+PHOTO_DELAY_SECONDS = 5
+PHOTO_NEGATIVE_TTL = 6 * 60 * 60
+PHOTO_POSITIVE_TTL = 30 * 24 * 60 * 60
 
 
 @contextmanager
@@ -68,6 +77,13 @@ def prepare_db():
                 token_hash TEXT PRIMARY KEY,
                 telegram_user_id TEXT NOT NULL,
                 expires_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS web_photo_lookup (
+                shop_id INTEGER NOT NULL,
+                product_code TEXT NOT NULL,
+                checked_at INTEGER NOT NULL,
+                found INTEGER NOT NULL,
+                PRIMARY KEY(shop_id, product_code)
             );
             CREATE TABLE IF NOT EXISTS web_product_stock (
                 shop_id INTEGER NOT NULL,
@@ -151,11 +167,97 @@ def stock_quantity(conn, shop_id, identity):
     return float(r["quantity"]) if r else None
 
 
+def cached_photo(db, shop_id, item):
+    """Reuse only exact product-code photos; never join on a shared seller SKU."""
+    photo = bot.gallery_medium_url(item["image_url"])
+    if photo:
+        return photo
+    code = str(item["kaspi_product_code"] or "").strip()
+    if not code:
+        return None
+    hit = db.conn.execute(
+        "SELECT image_url FROM order_items WHERE shop_id=? AND kaspi_product_code=? "
+        "AND image_url IS NOT NULL AND LENGTH(image_url)>12 "
+        "ORDER BY rowid DESC LIMIT 1", (shop_id, code)
+    ).fetchone()
+    return bot.gallery_medium_url(hit["image_url"]) if hit else None
+
+
+def photo_worker():
+    while True:
+        shop, code = PHOTO_QUEUE.get()
+        try:
+            # Import + invocation confined to background worker; HTTP never blocks web UI.
+            image = asyncio.run(bot.resolve_public_product_image(code))
+            image = bot.gallery_medium_url(image)
+            with connect() as conn:
+                if image:
+                    conn.execute(
+                        "UPDATE order_items SET image_url=? "
+                        "WHERE shop_id=? AND kaspi_product_code=?",
+                        (image, shop, code),
+                    )
+                conn.execute(
+                    "INSERT INTO web_photo_lookup(shop_id,product_code,checked_at,found) VALUES (?,?,?,?) "
+                    "ON CONFLICT(shop_id,product_code) DO UPDATE SET "
+                    "checked_at=excluded.checked_at, found=excluded.found",
+                    (shop, code, now(), 1 if image else 0),
+                )
+        except Exception as exc:
+            print("Photo lookup failed:", type(exc).__name__, flush=True)
+        finally:
+            with PHOTO_LOCK:
+                PHOTO_PENDING.discard((shop, code))
+            PHOTO_QUEUE.task_done()
+        # Slow down external lookups to avoid Kaspi HTTP 429.
+        time.sleep(PHOTO_DELAY_SECONDS)
+
+
+def schedule_photos(conn, shop, row_ids):
+    if not isinstance(row_ids, list) or len(row_ids)>28:
+        raise ValueError("Можно проверить не более 28 товаров за раз")
+    clean = []
+    for rid in row_ids:
+        if isinstance(rid, bool):
+            continue
+        try: clean.append(int(rid))
+        except (TypeError, ValueError): continue
+    clean = sorted(set(r for r in clean if r>0))
+    if not clean:
+        return 0
+    marks = ",".join("?" for _ in clean)
+    rows = conn.execute(
+        f"SELECT rowid AS rid,kaspi_product_code,image_url FROM order_items "
+        f"WHERE shop_id=? AND rowid IN ({marks})", [shop, *clean]
+    ).fetchall()
+    queued=0
+    for row in rows:
+        code = str(row["kaspi_product_code"] or "").strip()
+        if not code or cached_photo(database_view(conn), shop, row):
+            continue
+        prior = conn.execute(
+            "SELECT checked_at,found FROM web_photo_lookup WHERE shop_id=? AND product_code=?", (shop,code)
+        ).fetchone()
+        if prior and now() - int(prior["checked_at"]) < (PHOTO_POSITIVE_TTL if prior["found"] else PHOTO_NEGATIVE_TTL):
+            continue
+        key=(shop,code)
+        with PHOTO_LOCK:
+            if key in PHOTO_PENDING:
+                continue
+            try:
+                PHOTO_QUEUE.put_nowait(key)
+            except queue.Full:
+                break
+            PHOTO_PENDING.add(key)
+            queued+=1
+    return queued
+
+
 def make_products(db, shop_id):
     result = []
     for item in db.catalog_products(shop_id):
         origin = db.conn.execute(
-            "SELECT sku,name,category,kaspi_product_code,master_product_id FROM order_items "
+            "SELECT sku,name,category,kaspi_product_code,master_product_id,image_url FROM order_items "
             "WHERE shop_id=? AND rowid=?", (shop_id, item["item_rowid"]),
         ).fetchone()
         if origin is None:
@@ -169,7 +271,7 @@ def make_products(db, shop_id):
             "sku": item["sku"],
             "name": item["name"],
             "category": bot.cost_product_type(item["name"], item["category"]),
-            "photo": item["image_url"] if str(item["image_url"] or "").startswith("https://") else None,
+            "photo": cached_photo(db, shop_id, origin),
             "sales_price": item["sale_price"],
             "cost": item["cost_price"],
             "stock": stock_quantity(db.conn, shop_id, key),
@@ -278,6 +380,28 @@ class Handler(BaseHTTPRequestHandler):
             fname = "panel.html" if path == "/" else path.lstrip("/")
             mimetype = "text/html" if fname.endswith("html") else "text/css" if fname.endswith("css") else "text/javascript"
             return self.send(200, (FILES / fname).read_bytes(), mimetype + "; charset=utf-8")
+        if path == "/api/photos/status":
+            args = parse_qs(route.query)
+            shop = self.require_shop(user, args.get("shop", [""])[0])
+            if shop is None: return
+            try:
+                ids = [int(x) for x in args.get("ids", [""])[0].split(",") if x]
+            except ValueError:
+                return self.send(400, {"error": "Неверный список товаров"})
+            if len(ids)>28: return self.send(400, {"error": "Слишком много товаров"})
+            with connect() as conn:
+                db = database_view(conn)
+                photos = {}
+                for rid in ids:
+                    row = conn.execute(
+                        "SELECT rowid AS rid,kaspi_product_code,image_url FROM order_items WHERE shop_id=? AND rowid=?", (shop,rid)
+                    ).fetchone()
+                    if row:
+                        url = cached_photo(db, shop, row)
+                        if url: photos[str(rid)] = url
+            with PHOTO_LOCK:
+                pending = sum(1 for j,_ in PHOTO_PENDING if j == shop)
+            return self.send(200, {"photos":photos, "pending":pending})
         if path == "/api/shops":
             with connect() as conn:
                 rows = conn.execute("SELECT id,name,is_active FROM shops WHERE telegram_user_id=? ORDER BY is_active DESC, name", (user,)).fetchall()
@@ -336,6 +460,12 @@ class Handler(BaseHTTPRequestHandler):
                     with connect() as conn:
                         conn.execute("DELETE FROM web_sessions WHERE token_hash=?", (digest(raw["ks_session"].value),))
                 return self.send(200, {"ok": True}, extra={"Set-Cookie": "ks_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"})
+            if route == "/api/photos/queue":
+                shop = self.require_shop(user, data.get("shop"))
+                if shop is None: return
+                with connect() as conn:
+                    queued = schedule_photos(conn, shop, data.get("row_ids"))
+                return self.send(200, {"queued": queued})
             if route != "/api/save":
                 return self.send(404, {"error": "Не найдено"})
             shop = self.require_shop(user, data.get("shop"))
@@ -386,6 +516,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def start_server():
     prepare_db()
+    threading.Thread(target=photo_worker, daemon=True, name="kaspi-photo-worker").start()
     host = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     thread = threading.Thread(target=host.serve_forever, daemon=True, name="kaspi-web-panel")
     thread.start()

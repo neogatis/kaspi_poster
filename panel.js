@@ -4,6 +4,32 @@ const state={products:[],shops:[],shop:null,section:'all',query:'',category:'',p
 const format=(v)=>Number(v||0).toLocaleString('ru-RU',{maximumFractionDigits:2});
 const escapeHtml=(s)=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let toastTimeout;
+let photoTimer=null, photoRequest=0;
+function onPage(){const shown=available();return shown.slice(state.page*state.pageSize,(state.page+1)*state.pageSize)}
+function photoMessage(message){el('photoProgress').textContent=message;}
+async function pollPhotos(seq, rowIds){
+ if(seq!==photoRequest||!state.shop)return;
+ try{
+   const res=await api('/api/photos/status?shop='+state.shop+'&ids='+rowIds.join(','));
+   let count=0;
+   for(const row of state.products){const url=res.photos[String(row.row_id)];if(url&&!row.photo){row.photo=url;count++;}}
+   if(count)render();
+   const remaining=onPage().filter(x=>!x.photo).length;
+   if(res.pending>0){photoMessage(`Ищем фотографии через Kaspi · в очереди ${res.pending} · осталось без фото на странице ${remaining}`);photoTimer=setTimeout(()=>pollPhotos(seq,rowIds),6000);}
+   else photoMessage(remaining?`Не все фотографии доступны в Kaspi: осталось ${remaining} без фото на странице. Можно повторить позже.`:'Все доступные фотографии на странице загружены.');
+ }catch(e){photoMessage(`Поиск фото: ${e.message}`);}
+}
+async function queuePhotos(){
+ if(!state.shop)return;
+ clearTimeout(photoTimer);const seq=++photoRequest;
+ const rows=onPage();const missing=rows.filter(x=>!x.photo);
+ if(!missing.length){photoMessage('Все фотографии на этой странице уже есть.');return}
+ photoMessage(`Проверяем ${missing.length} товаров через Kaspi. Загрузка идёт постепенно…`);
+ try{
+   await api('/api/photos/queue',payload({shop:state.shop,row_ids:missing.map(x=>x.row_id)}));
+   if(seq===photoRequest)photoTimer=setTimeout(()=>pollPhotos(seq,rows.map(x=>x.row_id)),3500);
+ }catch(e){photoMessage('Не удалось загрузить фотографии: '+e.message);}
+}
 function toast(message,err=false){const node=el('toast');node.textContent=message;node.className='toast show'+(err?' error':'');clearTimeout(toastTimeout);toastTimeout=setTimeout(()=>node.className='toast',4000)}
 async function api(path,options={}){let res=await fetch(path,{credentials:'same-origin',...options});if(res.status===401){location.href='/login';throw new Error('Необходимо войти повторно')}if(!res.ok){let body={};try{body=await res.json()}catch{}throw new Error(body.error||`Ошибка ${res.status}`)}return res.json()}
 const payload=(value)=>({method:'POST',headers:{'Content-Type':'application/json','X-Panel-Request':'1'},body:JSON.stringify(value)});
@@ -15,9 +41,9 @@ function refreshStats(){let list=state.products;el('statAll').textContent=format
 function refreshSaveBar(){const count=state.drafts.size;el('saveBar').hidden=!count;el('dirtyInfo').textContent=`Изменено позиций: ${count}`;el('saveBtn').disabled=state.saving;}
 function render(){sectionInfo();refreshStats();refreshSaveBar();let list=available();let pages=Math.max(1,Math.ceil(list.length/state.pageSize));state.page=Math.min(state.page,pages-1);let shown=list.slice(state.page*state.pageSize,(state.page+1)*state.pageSize);const target=el('productRows');target.innerHTML=shown.map(row=>{
 const cat=escapeHtml(row.category), sku=escapeHtml(row.sku), name=escapeHtml(row.name),code=escapeHtml(row.identity),draft=dirty(row),isCost=row.cost!==null,flag=row.group!==null;
-const pic=row.photo?`<img class="thumb" loading="lazy" src="${escapeHtml(row.photo)}" alt="" referrerpolicy="no-referrer">`:`<div class="thumb placeholder">▧</div>`;
+const pic=row.photo?`<img class="thumb" loading="lazy" src="${escapeHtml(row.photo)}" alt="Фото товара" referrerpolicy="no-referrer">`:`<div class="thumb placeholder" title="У Kaspi пока нет фото для этого товара">▧</div>`;
 return `<tr data-code="${code}"><td><div class="product">${pic}<div><div class="product-name" title="${name}">${name}</div><div class="product-meta">${cat} · ${format(row.orders)} заказов</div></div></div></td><td><div class="sku">${sku}</div></td><td>${row.sales_price===null?'<span class="muted">—</span>':`${format(row.sales_price)} ₸`}</td><td><div class="cost-wrap"><input aria-label="Себестоимость за штуку" class="edit-input ${Object.hasOwn(draft,'cost')?'modified':''}" type="number" min="0" step="any" data-field="cost" data-code="${code}" placeholder="Не задана" value="${escapeHtml(value(row,'cost')??'')}"><small class="${isCost?'has-cost':'missing'}">${isCost?'✓ цена за 1 шт.':'• не заполнено'}</small></div></td><td><input aria-label="Остаток на складе" class="edit-input ${Object.hasOwn(draft,'stock')?'modified':''}" type="number" min="0" step="any" data-field="stock" data-code="${code}" placeholder="—" value="${escapeHtml(value(row,'stock')??'')}"></td><td><label class="scope-label ${flag?'':'scope-disabled'}"><input type="checkbox" data-code="${code}" data-field="model" ${draft.scope==='model'?'checked':''} ${flag?'':'disabled'}> Все цвета модели</label></td></tr>`}).join('');el('empty').hidden=shown.length>0;el('pagerInfo').textContent=`Показано ${shown.length} из ${list.length} товаров`;el('pageInfo').textContent=`${state.page+1} / ${pages}`;el('prevBtn').disabled=state.page===0;el('nextBtn').disabled=state.page>=pages-1;}
-async function reload(){if(state.drafts.size&&!confirm('Есть несохранённые изменения. Отменить их и обновить список?'))return;state.drafts.clear();el('productRows').innerHTML='<tr><td colspan="6" class="muted">Загружаем товары…</td></tr>';try{let r=await api('/api/products?shop='+encodeURIComponent(state.shop));state.products=r.products;state.page=0;const categories=[...new Set(state.products.map(x=>x.category))].sort();el('category').innerHTML='<option value="">Все категории</option>'+categories.map(x=>`<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('');state.category='';render()}catch(e){toast(e.message,true)}}
+async function reload(){if(state.drafts.size&&!confirm('Есть несохранённые изменения. Отменить их и обновить список?'))return;state.drafts.clear();el('productRows').innerHTML='<tr><td colspan="6" class="muted">Загружаем товары…</td></tr>';try{let r=await api('/api/products?shop='+encodeURIComponent(state.shop));state.products=r.products;state.page=0;const categories=[...new Set(state.products.map(x=>x.category))].sort();el('category').innerHTML='<option value="">Все категории</option>'+categories.map(x=>`<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('');state.category='';render();queuePhotos()}catch(e){toast(e.message,true)}}
 function onEdit(ev){let input=ev.target;if(!input.matches('[data-field]'))return;let row=state.products.find(x=>x.identity===input.dataset.code);if(!row)return;let item=dirty(row);if(input.dataset.field==='model'){item.scope=input.checked?'model':'product';if(!Object.hasOwn(item,'cost'))item.cost=row.cost??'';}else item[input.dataset.field]=input.value;state.drafts.set(row.identity,item);input.classList.add('modified');refreshSaveBar()}
 async function save(){if(state.saving)return;let items=[];for(const [identity,d] of state.drafts.entries()){const p=state.products.find(row=>row.identity===identity);if(!p)continue;const item={identity,row_id:p.row_id};if(Object.hasOwn(d,'cost')&&String(d.cost).trim()!=='')item.cost=Number(String(d.cost).replace(',','.'));if(Object.hasOwn(d,'stock')&&String(d.stock).trim()!=='')item.stock=Number(String(d.stock).replace(',','.'));if(Object.hasOwn(item,'cost'))item.scope=d.scope||'product';if(Object.hasOwn(item,'cost')||Object.hasOwn(item,'stock'))items.push(item)}if(!items.length){toast('Укажите сумму или количество',true);return}if(items.some(x=>(x.cost!==undefined&&(!Number.isFinite(x.cost)||x.cost<0))||(x.stock!==undefined&&(!Number.isFinite(x.stock)||x.stock<0)))){toast('Исправьте некорректные числа',true);return}
 state.saving=true;refreshSaveBar();try{for(let i=0;i<items.length;i+=100)await api('/api/save',payload({shop:state.shop,items:items.slice(i,i+100)}));state.drafts.clear();toast('✓ Изменения сохранены в базе Kaspi Profit Bot');let r=await api('/api/products?shop='+encodeURIComponent(state.shop));state.products=r.products;render()}catch(e){toast(e.message,true)}finally{state.saving=false;refreshSaveBar()}}
@@ -26,10 +52,11 @@ async function importCsv(file){if(!file)return;try{let rows=parseCsv(await file.
 async function boot(){try{const r=await api('/api/shops');state.shops=r.shops;if(!r.shops.length){toast('В Telegram сначала подключите магазин через /shops',true);return}el('shopSelect').innerHTML=r.shops.map(s=>`<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');state.shop=r.shops[0].id;await reload()}catch(e){toast(e.message,true)}}
 el('productRows').addEventListener('input',onEdit);el('productRows').addEventListener('change',onEdit);
 document.querySelectorAll('.side-link').forEach(b=>b.addEventListener('click',()=>{state.section=b.dataset.section;state.page=0;render()}));
-el('query').addEventListener('input',e=>{state.query=e.target.value;state.page=0;render()});el('category').addEventListener('change',e=>{state.category=e.target.value;state.page=0;render()});
+el('query').addEventListener('input',e=>{state.query=e.target.value;state.page=0;render()});el('category').addEventListener('change',e=>{state.category=e.target.value;state.page=0;render();queuePhotos()});
 el('shopSelect').addEventListener('change',async e=>{if(state.drafts.size&&!confirm('Изменения не сохранены. Переключить магазин?')){e.target.value=state.shop;return}state.shop=Number(e.target.value);await reload()});
-el('prevBtn').addEventListener('click',()=>{state.page--;render()});el('nextBtn').addEventListener('click',()=>{state.page++;render()});
-el('refreshBtn').addEventListener('click',reload);el('saveBtn').addEventListener('click',save);el('discardBtn').addEventListener('click',()=>{state.drafts.clear();render();toast('Изменения отменены')});
+el('prevBtn').addEventListener('click',()=>{state.page--;render();queuePhotos()});el('nextBtn').addEventListener('click',()=>{state.page++;render();queuePhotos()});
+el('refreshBtn').addEventListener('click',reload);el('loadPhotosBtn').addEventListener('click',queuePhotos);
+el('productRows').addEventListener('error',e=>{if(e.target.matches('img.thumb')){e.target.replaceWith(Object.assign(document.createElement('div'),{className:'thumb placeholder',textContent:'▧',title:'Не удалось открыть изображение с Kaspi'}));}},true);el('saveBtn').addEventListener('click',save);el('discardBtn').addEventListener('click',()=>{state.drafts.clear();render();toast('Изменения отменены')});
 el('exportBtn').addEventListener('click',()=>{if(state.shop!==null)location.href='/api/export.csv?shop='+state.shop});
 el('importBtn').addEventListener('click',()=>el('csvFile').click());el('csvFile').addEventListener('change',e=>importCsv(e.target.files[0]));
 el('logoutBtn').addEventListener('click',async()=>{try{await api('/api/logout',payload({}))}finally{location.href='/login'}});
