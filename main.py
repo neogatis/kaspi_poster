@@ -267,6 +267,18 @@ CREATE TABLE IF NOT EXISTS model_costs (
 CREATE INDEX IF NOT EXISTS idx_model_costs_shop
 ON model_costs(shop_id);
 
+CREATE TABLE IF NOT EXISTS product_cost_overrides (
+    shop_id INTEGER NOT NULL,
+    identity_key TEXT NOT NULL,
+    sku TEXT,
+    category TEXT,
+    name TEXT,
+    cost_price REAL NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(shop_id, identity_key),
+    FOREIGN KEY(shop_id) REFERENCES shops(id) ON DELETE CASCADE
+);
+
 
 CREATE TABLE IF NOT EXISTS cost_repair_backup (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -558,19 +570,45 @@ def normalize_model_name(name):
     return " ".join(cleaned).strip()
 
 
+
+
+def cost_product_type(name, category=None):
+    """Normalize type, taking specific item title before broad Kaspi category."""
+    types = (
+        ("палантин", ("палантин", "stole")),
+        ("шапка", ("шапк", "шапоч", "beanie")),
+        ("берет", ("берет",)),
+        ("панама", ("панам", "bucket hat")),
+        ("перчатки", ("перчат", "glove")),
+        ("варежки", ("вареж", "mitten")),
+        ("шарф", ("шарф", "scarf")),
+        ("снуд", ("снуд",)),
+        ("кепка", ("кепк", "бейсболк")),
+        ("картуз", ("картуз",)),
+    )
+    title = str(name or "").lower().replace("ё", "е")
+    fallback = str(category or "").lower().replace("ё", "е")
+    for value in (title, fallback):
+        for label, stems in types:
+            if any(term in value for term in stems):
+                return label
+    return re.sub(r"\s+", " ", fallback).strip() or "неизвестная категория"
+
+
+def product_cost_identity(item):
+    """SKU is NOT a unique identifier. Include class and Kaspi product identity/name."""
+    category = cost_product_type(item["name"], item["category"])
+    unique_code = str(item["kaspi_product_code"] or item["master_product_id"] or item["sku"] or "").strip()
+    name = re.sub(r"\s+", " ", str(item["name"] or "").lower().replace("ё", "е")).strip()
+    return f"{category}::{unique_code}::{name}"
+
 def model_cost_group_key(name, category=None):
     normalized = normalize_model_name(name)
 
     if not is_safe_normalized_model_name(normalized):
         return None
 
-    category_norm = re.sub(
-        r"\s+",
-        " ",
-        str(category or "").strip().lower().replace("ё", "е"),
-    )
-
-    return f"{category_norm}::{normalized}"
+    return f"{cost_product_type(name, category)}::{normalized}"
 
 
 def model_display_name(name):
@@ -1786,6 +1824,8 @@ class Database:
         grouped = {}
         for row in rows:
             key = model_cost_group_key(row["name"], row["category"])
+            if self.sku_is_ambiguous(shop_id, row["sku"]):
+                continue
             if not key:
                 continue
             grouped.setdefault(key, []).append(row)
@@ -1811,6 +1851,85 @@ class Database:
             "SELECT * FROM costs WHERE shop_id=? AND sku=?",
             (shop_id, str(sku)),
         ).fetchone()
+
+    def sku_is_ambiguous(self, shop_id, sku):
+        if not sku:
+            return True
+        rows = self.conn.execute(
+            "SELECT DISTINCT name, category, kaspi_product_code, master_product_id, sku "
+            "FROM order_items WHERE shop_id=? AND sku=?",
+            (shop_id, str(sku)),
+        ).fetchall()
+        groups = set()
+        for row in rows:
+            key = model_cost_group_key(row["name"], row["category"])
+            groups.add(key or product_cost_identity(row))
+            if len(groups) > 1:
+                return True
+        return False
+
+    def cost_for_item(self, shop_id, item):
+        """Always use item identity. Never reuse SKU cost for another model/category."""
+        if item is None:
+            return None
+        identity = product_cost_identity(item)
+        specific = self.conn.execute(
+            "SELECT cost_price FROM product_cost_overrides WHERE shop_id=? AND identity_key=?",
+            (shop_id, identity),
+        ).fetchone()
+        if specific:
+            return self._resolved_cost_record(shop_id, item, specific["cost_price"])
+        group_key = model_cost_group_key(item["name"], item["category"])
+        if group_key:
+            model = self.model_cost(shop_id, group_key)
+            if model:
+                return self._resolved_cost_record(shop_id, item, model["cost_price"])
+        sku = item["sku"]
+        if self.sku_is_ambiguous(shop_id, sku):
+            return None
+        return self.cost(shop_id, sku)
+
+    def _resolved_cost_record(self, shop_id, item, price):
+        # Legacy SKU-level commissions are safe only if there is no collision.
+        legacy = None
+        if not self.sku_is_ambiguous(shop_id, item["sku"]):
+            legacy = self.cost(shop_id, item["sku"])
+        fields = ("commission_rate", "tax_rate", "acquiring_rate", "packaging_cost", "other_cost")
+        return dict(cost_price=float(price), **{
+            f: float(legacy[f] or 0) if legacy else 0.0 for f in fields
+        })
+
+    def set_cost_for_item(self, shop_id, item, price, *, whole_model=False):
+        """Explicit model assignment or exact product override; never mutates shared SKU cost."""
+        price = float(price)
+        if price < 0:
+            raise ValueError("Negative cost")
+        group_key = model_cost_group_key(item["name"], item["category"])
+        if whole_model and group_key:
+            self.upsert_model_cost(shop_id, group_key, model_display_name(item["name"]), price)
+            return "model"
+        self.conn.execute(
+            """INSERT INTO product_cost_overrides
+               (shop_id,identity_key,sku,category,name,cost_price,updated_at)
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(shop_id,identity_key) DO UPDATE SET
+                 cost_price=excluded.cost_price,updated_at=excluded.updated_at""",
+            (shop_id, product_cost_identity(item), item["sku"],
+             cost_product_type(item["name"], item["category"]), item["name"],
+             price, datetime.now(timezone.utc).isoformat()),
+        )
+        self.conn.commit()
+        return "product"
+
+    def same_model_products(self, shop_id, item, limit=50):
+        key = model_cost_group_key(item["name"], item["category"])
+        if not key:
+            return [item]
+        rows = self.conn.execute(
+            """SELECT DISTINCT name,category,sku,kaspi_product_code,master_product_id
+               FROM order_items WHERE shop_id=?""", (shop_id,),
+        ).fetchall()
+        return [row for row in rows if model_cost_group_key(row["name"], row["category"]) == key][:limit]
 
     def model_cost(self, shop_id, group_key):
         if not group_key:
@@ -2053,12 +2172,8 @@ class Database:
             cost_price,
         )
 
-        for row in variants:
-            self.upsert_single_cost(
-                shop_id,
-                row["sku"],
-                cost_price,
-            )
+        # Model price is resolved by name + product type at calculation time.
+        # Deliberately do not write SKU costs: a SKU may label both a hat and a stole.
 
         return variants
 
@@ -2084,11 +2199,8 @@ class Database:
         if len(variants) > MAX_AUTO_MODEL_VARIANTS:
             return False
 
-        self.upsert_single_cost(
-            shop_id,
-            sku,
-            float(saved["cost_price"]),
-        )
+        # Price is inherited dynamically by cost_for_item, without corrupting
+        # a shared SKU. No legacy cost write is necessary.
         return True
 
     def propagate_model_costs(self, shop_id):
@@ -2144,50 +2256,44 @@ class Database:
             )
         self.conn.commit()
 
-    def catalog_products(self, shop_id):
-        """One row per exact SKU seen in synchronized orders."""
-        return self.conn.execute(
-            """SELECT
-                 oi.sku AS sku,
-                 COALESCE(MAX(NULLIF(oi.name,'')), 'Без названия') AS name,
-                 MAX(NULLIF(oi.kaspi_product_code,'')) AS kaspi_product_code,
-                 MAX(NULLIF(oi.category,'')) AS category,
-                 MAX(NULLIF(oi.image_url,'')) AS image_url,
-                 MAX(o.creation_ms) AS last_order_ms,
-                 COUNT(DISTINCT oi.order_id) AS order_count,
-                 (
-                   SELECT CASE
-                     WHEN recent_oi.quantity > 0
-                       THEN recent_oi.total_price / recent_oi.quantity
-                     ELSE recent_oi.total_price
-                   END
-                   FROM order_items recent_oi
-                   JOIN orders recent_o
-                     ON recent_o.shop_id=recent_oi.shop_id
-                    AND recent_o.id=recent_oi.order_id
-                   WHERE recent_oi.shop_id=oi.shop_id
-                     AND recent_oi.sku=oi.sku
-                   ORDER BY recent_o.creation_ms DESC
-                   LIMIT 1
-                 ) AS sale_price,
-                 c.cost_price AS cost_price,
-                 c.commission_rate AS commission_rate,
-                 c.tax_rate AS tax_rate,
-                 c.acquiring_rate AS acquiring_rate,
-                 c.packaging_cost AS packaging_cost,
-                 c.other_cost AS other_cost
-               FROM order_items oi
-               JOIN orders o
-                 ON o.shop_id=oi.shop_id AND o.id=oi.order_id
-               LEFT JOIN costs c
-                 ON c.shop_id=oi.shop_id AND c.sku=oi.sku
-               WHERE oi.shop_id=?
-                 AND oi.sku IS NOT NULL
-                 AND TRIM(oi.sku)<>''
-               GROUP BY oi.sku
-               ORDER BY last_order_ms DESC, oi.sku""",
-            (shop_id,),
+    def ambiguous_skus(self, shop_id):
+        rows = self.conn.execute(
+            "SELECT DISTINCT sku FROM order_items WHERE shop_id=? AND sku IS NOT NULL", (shop_id,),
         ).fetchall()
+        return [row["sku"] for row in rows if self.sku_is_ambiguous(shop_id, row["sku"])]
+
+    def catalog_products(self, shop_id):
+        """One entry per real Kaspi item, not merchant SKU (SKU can be reused)."""
+        rows = self.conn.execute(
+            """SELECT oi.rowid AS item_rowid, oi.*, o.creation_ms AS last_order_ms
+               FROM order_items oi JOIN orders o
+                 ON o.shop_id=oi.shop_id AND o.id=oi.order_id
+               WHERE oi.shop_id=? AND oi.sku IS NOT NULL AND TRIM(oi.sku)<>''
+               ORDER BY o.creation_ms DESC, oi.rowid DESC""", (shop_id,),
+        ).fetchall()
+        groups = {}
+        for item in rows:
+            identity = product_cost_identity(item)
+            if identity not in groups:
+                cost = self.cost_for_item(shop_id, item)
+                result = {
+                    "item_rowid": item["item_rowid"], "sku": item["sku"],
+                    "name": item["name"] or "Без названия",
+                    "kaspi_product_code": item["kaspi_product_code"],
+                    "category": item["category"], "image_url": item["image_url"],
+                    "last_order_ms": item["last_order_ms"],
+                    "order_count": 0,
+                    "sale_price": (float(item["total_price"] or 0)/float(item["quantity"])
+                                   if float(item["quantity"] or 0) > 0 else None),
+                    "cost_price": float(cost["cost_price"]) if cost else None,
+                }
+                for field in ("commission_rate", "tax_rate", "acquiring_rate", "packaging_cost", "other_cost"):
+                    result[field] = float(cost[field] or 0) if cost else 0
+                groups[identity] = (result, set())
+            result, orders = groups[identity]
+            orders.add(item["order_id"])
+            result["order_count"] = len(orders)
+        return [entry[0] for entry in groups.values()]
 
     def upsert_cost_partial(
         self,
@@ -2205,6 +2311,10 @@ class Database:
         if not sku:
             return False
 
+        if self.sku_is_ambiguous(shop_id, sku):
+            # Legacy XLSX imports cannot disambiguate product identity by SKU.
+            # Do not attach a hat price to a stole with the same article.
+            return False
         existing = self.cost(shop_id, sku)
 
         def num(value, fallback):
@@ -2264,184 +2374,60 @@ class Database:
         return True
 
     def filled_cost_count(self, shop_id):
-        row = self.conn.execute(
-            """SELECT COUNT(*) AS n
-               FROM costs
-               WHERE shop_id=?""",
-            (shop_id,),
-        ).fetchone()
-        return int(row["n"] or 0)
+        return sum(1 for row in self.catalog_products(shop_id) if row["cost_price"] is not None)
 
-    def filled_cost_examples(
-        self,
-        shop_id,
-        limit=8,
-        offset=0,
-    ):
-        return self.conn.execute(
-            """SELECT
-                 MIN(oi.rowid) AS item_rowid,
-                 c.sku AS sku,
-                 c.cost_price AS cost_price,
-                 COALESCE(MAX(NULLIF(oi.name,'')), 'Без названия') AS name,
-                 MAX(NULLIF(oi.kaspi_product_code,'')) AS kaspi_product_code,
-                 MAX(NULLIF(oi.image_url,'')) AS image_url,
-                 MAX(o.creation_ms) AS last_order_ms
-               FROM costs c
-               LEFT JOIN order_items oi
-                 ON oi.shop_id=c.shop_id AND oi.sku=c.sku
-               LEFT JOIN orders o
-                 ON o.shop_id=oi.shop_id AND o.id=oi.order_id
-               WHERE c.shop_id=?
-               GROUP BY c.sku
-               ORDER BY c.updated_at DESC, last_order_ms DESC
-               LIMIT ? OFFSET ?""",
-            (
-                shop_id,
-                int(limit),
-                int(offset),
-            ),
+    def filled_cost_examples(self, shop_id, limit=8, offset=0):
+        rows = [row for row in self.catalog_products(shop_id) if row["cost_price"] is not None]
+        return rows[int(offset):int(offset)+int(limit)]
+
+    def _missing_cost_products(self, shop_id, start_ms=None, end_ms=None, limit=None):
+        period = ""
+        params = [shop_id]
+        if start_ms is not None and end_ms is not None:
+            period = (" AND ((o.creation_ms>=? AND o.creation_ms<?) "
+                      "OR (o.completion_ms>=? AND o.completion_ms<?))")
+            params.extend([int(start_ms), int(end_ms), int(start_ms), int(end_ms)])
+        rows = self.conn.execute(
+            """SELECT oi.rowid AS item_rowid, oi.*, o.code AS order_code,
+                      o.creation_ms AS last_order_ms
+               FROM order_items oi JOIN orders o
+               ON o.shop_id=oi.shop_id AND o.id=oi.order_id
+               WHERE oi.shop_id=? AND oi.sku IS NOT NULL AND TRIM(oi.sku)<>''"""
+            + period + " ORDER BY o.creation_ms DESC, oi.rowid DESC", params,
         ).fetchall()
+        seen = set()
+        result = []
+        for item in rows:
+            identity = product_cost_identity(item)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if self.cost_for_item(shop_id, item):
+                continue
+            result.append({
+                "item_rowid": item["item_rowid"], "sku": item["sku"],
+                "name": item["name"], "category": item["category"],
+                "kaspi_product_code": item["kaspi_product_code"],
+                "order_code": item["order_code"],
+                "sample_price": float(item["total_price"] or 0) /
+                    float(item["quantity"] or 1),
+                "order_count": 1, "last_order_ms": item["last_order_ms"],
+            })
+            if limit and len(result) >= limit:
+                break
+        return result
 
     def missing_cost_count(self, shop_id):
-        row = self.conn.execute(
-            """SELECT COUNT(DISTINCT oi.sku) AS n
-               FROM order_items oi
-               LEFT JOIN costs c
-                 ON c.shop_id=oi.shop_id AND c.sku=oi.sku
-               WHERE oi.shop_id=?
-                 AND oi.sku IS NOT NULL
-                 AND TRIM(oi.sku)<>''
-                 AND c.sku IS NULL""",
-            (shop_id,),
-        ).fetchone()
-        return int(row["n"] or 0)
+        return len(self._missing_cost_products(shop_id))
 
-    def missing_cost_count_for_report_period(
-        self,
-        shop_id,
-        start_ms,
-        end_ms,
-    ):
-        row = self.conn.execute(
-            """SELECT COUNT(DISTINCT oi.sku) AS n
-               FROM order_items oi
-               JOIN orders o
-                 ON o.shop_id=oi.shop_id AND o.id=oi.order_id
-               LEFT JOIN costs c
-                 ON c.shop_id=oi.shop_id AND c.sku=oi.sku
-               WHERE oi.shop_id=?
-                 AND oi.sku IS NOT NULL
-                 AND TRIM(oi.sku)<>''
-                 AND c.sku IS NULL
-                 AND (
-                   (o.creation_ms>=? AND o.creation_ms<?)
-                   OR
-                   (
-                     o.completion_ms IS NOT NULL
-                     AND o.completion_ms>=?
-                     AND o.completion_ms<?
-                   )
-                 )""",
-            (
-                shop_id,
-                int(start_ms),
-                int(end_ms),
-                int(start_ms),
-                int(end_ms),
-            ),
-        ).fetchone()
-        return int(row["n"] or 0)
+    def missing_cost_count_for_report_period(self, shop_id, start_ms, end_ms):
+        return len(self._missing_cost_products(shop_id, start_ms, end_ms))
 
-    def missing_cost_examples_for_report_period(
-        self,
-        shop_id,
-        start_ms,
-        end_ms,
-        limit=12,
-    ):
-        return self.conn.execute(
-            """SELECT
-                 MIN(oi.rowid) AS item_rowid,
-                 oi.sku AS sku,
-                 COALESCE(MAX(NULLIF(oi.name,'')), 'Без названия') AS name,
-                 MAX(o.code) AS order_code,
-                 MAX(
-                   CASE
-                     WHEN oi.quantity>0 THEN oi.total_price/oi.quantity
-                     ELSE oi.total_price
-                   END
-                 ) AS sample_price,
-                 COUNT(DISTINCT oi.order_id) AS order_count,
-                 MAX(
-                   CASE
-                     WHEN o.completion_ms IS NOT NULL
-                          AND o.completion_ms>=?
-                          AND o.completion_ms<?
-                       THEN o.completion_ms
-                     ELSE o.creation_ms
-                   END
-                 ) AS last_order_ms
-               FROM order_items oi
-               JOIN orders o
-                 ON o.shop_id=oi.shop_id AND o.id=oi.order_id
-               LEFT JOIN costs c
-                 ON c.shop_id=oi.shop_id AND c.sku=oi.sku
-               WHERE oi.shop_id=?
-                 AND oi.sku IS NOT NULL
-                 AND TRIM(oi.sku)<>''
-                 AND c.sku IS NULL
-                 AND (
-                   (o.creation_ms>=? AND o.creation_ms<?)
-                   OR
-                   (
-                     o.completion_ms IS NOT NULL
-                     AND o.completion_ms>=?
-                     AND o.completion_ms<?
-                   )
-                 )
-               GROUP BY oi.sku
-               ORDER BY last_order_ms DESC
-               LIMIT ?""",
-            (
-                int(start_ms),
-                int(end_ms),
-                shop_id,
-                int(start_ms),
-                int(end_ms),
-                int(start_ms),
-                int(end_ms),
-                int(limit),
-            ),
-        ).fetchall()
+    def missing_cost_examples_for_report_period(self, shop_id, start_ms, end_ms, limit=12):
+        return self._missing_cost_products(shop_id, start_ms, end_ms, limit)
 
     def missing_cost_examples(self, shop_id, limit=12):
-        return self.conn.execute(
-            """SELECT
-                 MIN(oi.rowid) AS item_rowid,
-                 oi.sku AS sku,
-                 COALESCE(MAX(NULLIF(oi.name,'')), 'Без названия') AS name,
-                 MAX(o.code) AS order_code,
-                 MAX(CASE
-                   WHEN oi.quantity>0 THEN oi.total_price/oi.quantity
-                   ELSE oi.total_price
-                 END) AS sample_price,
-                 COUNT(DISTINCT oi.order_id) AS order_count,
-                 MAX(o.creation_ms) AS last_order_ms
-               FROM order_items oi
-               JOIN orders o
-                 ON o.shop_id=oi.shop_id AND o.id=oi.order_id
-               LEFT JOIN costs c
-                 ON c.shop_id=oi.shop_id AND c.sku=oi.sku
-               WHERE oi.shop_id=?
-                 AND oi.sku IS NOT NULL
-                 AND TRIM(oi.sku)<>''
-                 AND c.sku IS NULL
-               GROUP BY oi.sku
-               ORDER BY last_order_ms DESC
-               LIMIT ?""",
-            (shop_id, int(limit)),
-        ).fetchall()
+        return self._missing_cost_products(shop_id, limit=limit)
 
     def item_by_rowid(self, shop_id, rowid):
         return self.conn.execute(
@@ -3375,7 +3361,7 @@ def return_loss_summary(shop_id, orders):
             summary["units"] += qty
             if warehouse:
                 summary["restocked_units"] += qty
-            cost = DB.cost(shop_id, item["sku"])
+            cost = DB.cost_for_item(shop_id, item)
             if not cost:
                 summary["missing_cost_units"] += qty
                 continue
@@ -3410,7 +3396,7 @@ def order_profit(shop_id, order):
     missing = set()
 
     for item in items:
-        cost = DB.cost(shop_id, item["sku"])
+        cost = DB.cost_for_item(shop_id, item)
 
         if not cost:
             missing.add(
@@ -3999,10 +3985,7 @@ def item_profit_breakdown(shop_id, order, items):
         else:
             delivery_share = 0.0
 
-        cost = DB.cost(
-            shop_id,
-            item["sku"],
-        )
+        cost = DB.cost_for_item(shop_id, item)
 
         if not cost or qty <= 0:
             result.append({
@@ -5473,7 +5456,7 @@ async def show_shops(update, context, edit=False):
 def missing_cost_keyboard(rows):
     buttons = []
     for row in rows:
-        label = f"💰 {row['sku']}"
+        label = f"💰 {cost_product_type(row.get('name'), row.get('category'))}: {str(row.get('name') or row['sku'])[:26]}"
         if len(label) > 45:
             label = label[:42] + "…"
         buttons.append([
@@ -5571,7 +5554,7 @@ async def send_next_cost_input(update, context, shop):
         return False
 
     # It may have been filled by another action between the query and now.
-    if DB.cost(shop["id"], item["sku"]):
+    if DB.cost_for_item(shop["id"], item):
         return await send_next_cost_input(
             update,
             context,
@@ -5599,7 +5582,8 @@ async def send_next_cost_input(update, context, shop):
         f"Kaspi код: <code>{html.escape(str(item['kaspi_product_code'] or '—'))}</code>\n"
         f"Заказ: <code>{html.escape(str(item['order_code'] or '—'))}</code>\n"
         f"{cost_card_price_lines(item)}\n\n"
-        "Отправьте только себестоимость в тенге.\n"
+        f"Категория: <b>{html.escape(cost_product_type(item['name'], item['category']))}</b>\n"
+        "Отправьте себестоимость <b>за 1 штуку</b> в тенге.\n"
         "Например: <code>1600</code>\n\n"
         "Чтобы остановиться без сохранения текущего товара — "
         "нажмите <b>⬅️ Назад</b>."
@@ -5807,6 +5791,31 @@ async def callback_costs(update, context):
         return
 
     data = query.data
+    if data.startswith("costgroup:"):
+        choice = data.split(":", 1)[1]
+        rowid = context.user_data.get("cost_rowid")
+        price = context.user_data.get("proposed_cost")
+        item = DB.item_by_rowid(shop["id"], rowid) if rowid else None
+        if context.user_data.get("shop_flow") != "cost_group_confirm" or not item or price is None:
+            await query.edit_message_text("Предложение устарело. Откройте заполнение ещё раз.")
+            return
+        if choice == "cancel":
+            context.user_data["shop_flow"] = "cost_input"
+            context.user_data.pop("proposed_cost", None)
+            await query.edit_message_text("Отменено. Отправьте другую сумму или «Назад».")
+            return
+        if choice not in ("all", "one"):
+            return
+        DB.set_cost_for_item(shop["id"], item, price, whole_model=(choice == "all"))
+        context.user_data.pop("proposed_cost", None)
+        context.user_data.pop("cost_rowid", None)
+        context.user_data["shop_flow"] = "cost_input"
+        await query.edit_message_text(
+            f"✅ Сохранено {money(price)} за 1 шт. " +
+            ("для всех цветов этой модели" if choice == "all" else "только для этого товара")
+        )
+        await send_next_cost_input(update, context, shop)
+        return
     if data == "missing:list":
         await show_missing_costs(update, context, edit=True)
         return
@@ -5821,7 +5830,7 @@ async def callback_costs(update, context):
             return
 
         # Если стоимость уже появилась между показом списка и нажатием — не просим повторно.
-        if DB.cost(shop["id"], item["sku"]):
+        if DB.cost_for_item(shop["id"], item):
             await query.edit_message_text(
                 f"✅ Для <code>{item['sku']}</code> себестоимость уже заполнена.",
                 parse_mode=ParseMode.HTML,
@@ -5843,7 +5852,8 @@ async def callback_costs(update, context):
             f"Kaspi код: <code>{html.escape(str(item['kaspi_product_code'] or '—'))}</code>\n"
             f"Заказ: <code>{html.escape(str(item['order_code'] or '—'))}</code>\n"
             f"{cost_card_price_lines(item)}\n\n"
-            "Себестоимость <b>за 1 шт.</b> сохранится только для этого SKU.\n"
+            "Себестоимость <b>за 1 шт.</b> сохранится для выбранного товара "
+            "или после подтверждения для всех цветов модели.\n"
             "После сохранения бот автоматически покажет следующий "
             "товар без себестоимости.\n\n"
             "Отправьте только число в тенге. Например: <code>1600</code>"
@@ -15474,10 +15484,7 @@ async def callback_cost_edit(update, context):
             )
             return
 
-        cost = DB.cost(
-            shop["id"],
-            item["sku"],
-        )
+        cost = DB.cost_for_item(shop["id"], item)
         if not cost:
             await query.edit_message_text(
                 "Для этого SKU себестоимость уже отсутствует."
@@ -15496,6 +15503,7 @@ async def callback_cost_edit(update, context):
             f"✏️ <b>Редактирование себестоимости</b>\n\n"
             f"Товар: <b>{html.escape(item['name'] or 'Без названия')}</b>\n"
             f"SKU: <code>{html.escape(str(item['sku']))}</code>\n"
+            f"Категория: <b>{html.escape(cost_product_type(item['name'], item['category']))}</b>\n"
             f"Текущая себестоимость: "
             f"<b>{money(float(cost['cost_price']))}</b>\n\n"
             "Отправьте себестоимость ОДНОЙ штуки.\n"
@@ -15730,8 +15738,9 @@ async def callback_cost_settings(update, context):
             "📤 <b>Загрузка себестоимости</b>\n\n"
             "Отправьте заполненный файл <b>.xlsx</b>, "
             "который ранее выгрузил бот.\n\n"
-            "Сопоставление идёт строго по SKU. "
-            "Пустые значения себестоимости пропускаются.",
+            "Однозначные SKU сопоставляются автоматически. "
+            "Повторяющиеся у разных моделей или категорий SKU пропускаются: "
+            "заполните их в Telegram, чтобы не смешивать цены.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -15862,6 +15871,15 @@ async def handle_shop_flow(update, context):
     user_id = update.effective_user.id
     text = (update.message.text or "").strip()
 
+    if flow == "cost_group_confirm":
+        if text.lower() in {"назад", "⬅️ назад", "/cancel"}:
+            context.user_data.pop("proposed_cost", None)
+            context.user_data["shop_flow"] = "cost_input"
+            await update.message.reply_text("Выбор отменён. Отправьте другую цену или «Назад».")
+        else:
+            await update.message.reply_text("Подтвердите цену кнопкой «Все цвета модели» или «Только этот товар» под предыдущим сообщением.")
+        return True
+
     if flow == "cost_input":
         shop_id = context.user_data.get("cost_shop_id")
         rowid = context.user_data.get("cost_rowid")
@@ -15933,13 +15951,30 @@ async def handle_shop_flow(update, context):
             )
             return True
 
-        sku = item["sku"]
+        variants = DB.same_model_products(shop_id, item)
+        key = model_cost_group_key(item["name"], item["category"])
+        if key and len(variants) > 1:
+            context.user_data["shop_flow"] = "cost_group_confirm"
+            context.user_data["proposed_cost"] = value
+            sample = ", ".join(str(row["name"] or "Товар") for row in variants[:4])
+            await update.message.reply_text(
+                f"💰 <b>{html.escape(item['name'] or 'Товар')}</b>\n"
+                f"Категория: <b>{html.escape(cost_product_type(item['name'], item['category']))}</b>\n"
+                f"Себестоимость: <b>{money(value)}</b> за 1 шт.\n"
+                f"Найдено вариантов модели: <b>{len(variants)}</b>\n"
+                f"Примеры: {html.escape(sample)}\n\n"
+                "Применить одинаковую цену ко всем цветам модели? "
+                "Другие категории и модели не затрагиваются.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Все цвета модели",callback_data="costgroup:all")],
+                    [InlineKeyboardButton("🔹 Только этот товар",callback_data="costgroup:one")],
+                    [InlineKeyboardButton("❌ Отмена",callback_data="costgroup:cancel")],
+                ]),
+            )
+            return True
 
-        DB.upsert_single_cost(
-            shop_id,
-            sku,
-            value,
-        )
+        DB.set_cost_for_item(shop_id, item, value, whole_model=False)
 
         # Clear only the current SKU pointer. The sequential flow
         # continues immediately with the next missing SKU.
@@ -16472,11 +16507,7 @@ async def handle_shop_flow(update, context):
             )
             return True
 
-        DB.upsert_single_cost(
-            shop_id,
-            item["sku"],
-            value,
-        )
+        DB.set_cost_for_item(shop_id, item, value, whole_model=False)
 
         context.user_data.pop(
             "shop_flow",
@@ -17060,7 +17091,7 @@ def build_app():
     app.add_handler(
         CallbackQueryHandler(
             callback_costs,
-            pattern=r"^(missing|costopen)",
+            pattern=r"^(missing|costopen|costgroup:)",
         )
     )
 
@@ -17097,7 +17128,7 @@ def build_app():
 
 
 if __name__ == "__main__":
-    print("Kaspi Profit Bot v4.18.0 — Units, Returns & Marketing browser fix")
+    print("Kaspi Profit Bot v4.19.0 — Safe model/category cost grouping")
     print("Database:", DB_PATH)
     print("Secret key:", KEY_PATH)
     print("Timezone:", TIMEZONE)
