@@ -15974,7 +15974,9 @@ async def handle_shop_flow(update, context):
             )
             return True
 
-        DB.set_cost_for_item(shop_id, item, value, whole_model=False)
+        # A safe, recognized model can inherit this price for colours not yet sold.
+        # Unrecognizable/ambiguous model names remain strictly per-item.
+        DB.set_cost_for_item(shop_id, item, value, whole_model=bool(key))
 
         # Clear only the current SKU pointer. The sequential flow
         # continues immediately with the next missing SKU.
@@ -17128,7 +17130,7 @@ def build_app():
 
 
 if __name__ == "__main__":
-    print("Kaspi Profit Bot v4.19.0 — Safe model/category cost grouping")
+    print("Kaspi Profit Bot v4.19.1 — Safe model/category cost grouping")
     print("Database:", DB_PATH)
     print("Secret key:", KEY_PATH)
     print("Timezone:", TIMEZONE)
